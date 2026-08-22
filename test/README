@@ -1,0 +1,15 @@
+This directory is intended for PlatformIO Test Runner and project tests.
+
+Unit Testing is a software testing method by which individual units of
+source code, sets of one or more MCU program modules together with associated
+control data, usage procedures, and operating procedures, are tested to
+determine whether they are fit for use.
+
+More information about PlatformIO Unit Testing:
+- https://docs.platformio.org/page/plus/unit-testing.html
+
+Note: this project's pure-logic host tests (median filter, rain accumulator,
+alert hysteresis, CSV formatting) live outside PlatformIO's test runner, in
+`tests/firmware/` at the repo root, compiled directly with g++. That harness
+predates this scaffold and is intentionally kept -- see
+`tests/firmware/run_tests.ps1`.
