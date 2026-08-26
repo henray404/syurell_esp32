@@ -13,9 +13,14 @@ static char g_isoBuf[24];
 
 inline void timeBegin() {
   g_rtcOk = g_rtc.begin();
-  if (g_rtcOk && g_rtc.lostPower()) {
+  if (!g_rtcOk) {
+    Serial.println("[RTC] tidak terdeteksi di I2C (cek wiring SDA=21/SCL=22, VCC, GND)");
+    return;
+  }
+  if (g_rtc.lostPower()) {
     // Battery dead or first power-up: the RTC value is meaningless. Leave it
     // marked bad rather than trusting it; NTP will correct it if WiFi appears.
+    Serial.println("[RTC] terdeteksi tapi lostPower=true (baterai CR2032 soak/belum pernah di-set waktu)");
     g_rtcOk = false;
   }
 }

@@ -9,6 +9,25 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "C/C++ Runner: Debug Session",
+            "type": "cppdbg",
+            "request": "launch",
+            "args": [],
+            "stopAtEntry": false,
+            "externalConsole": true,
+            "cwd": "c:/Users/Henry/Documents/KULIAH/OPSI/syurell/firmware/esp32/src",
+            "program": "c:/Users/Henry/Documents/KULIAH/OPSI/syurell/firmware/esp32/src/build/Debug/outDebug",
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:/Users/Henry/.platformio/packages/toolchain-xtensa-esp32/bin/xtensa-esp32-elf-gdb.exe",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
             "type": "platformio-debug",
             "request": "launch",
             "name": "PIO Debug",

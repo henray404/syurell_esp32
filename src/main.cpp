@@ -26,6 +26,7 @@ static LevelFsm    levelFsm;
 static Level       lastLevel = AMAN;
 static uint32_t    tipTotal  = 0;
 static const char *lastSmsStatus = "";
+static bool         ntpEverSynced = false;
 
 // Readings accumulated within the current logging minute, reduced to a median
 // at log time -- so the logged height is smoothed over the whole minute, not
@@ -60,6 +61,8 @@ static uint32_t takeTipCount() {
 // --- SCHEDULER (millis, non-blocking) ---
 static uint32_t tSensor = 0, tLog = 0, tUpload = 0, tNtp = 0, tSms = 0;
 
+
+
 // =============================================
 // SETUP
 // =============================================
@@ -90,15 +93,27 @@ void setup() {
 // BACA JARAK - JSN-SR04T (single ping)
 // =============================================
 static float pingOnce() {
+  // 20 us trigger, not the datasheet-minimum 10 us: on this JSN-SR04T a 10 us
+  // pulse produced no echo at all, a 20 us one reads every time.
   digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(20);
   digitalWrite(TRIG_PIN, LOW);
 
-  unsigned long durasi = pulseIn(ECHO_PIN, HIGH, 30000);
-  if (durasi == 0) return NAN;
-  return (durasi * 0.034f) / 2.0f;
+  // Poll the edges instead of pulseIn(); pulseIn() never caught this module's
+  // echo on this board even when the pulse was demonstrably there.
+  unsigned long tS = micros(), tRise = 0, tFall = 0;
+  while (micros() - tS < ULTRA_ECHO_TIMEOUT_US) {
+    if (digitalRead(ECHO_PIN)) { tRise = micros(); break; }
+  }
+  if (!tRise) return NAN;
+  while (micros() - tRise < ULTRA_ECHO_TIMEOUT_US) {
+    if (!digitalRead(ECHO_PIN)) { tFall = micros(); break; }
+  }
+  if (!tFall) return NAN;
+
+  return ((tFall - tRise) * 0.034f) / 2.0f;
 }
 
 // =============================================
@@ -118,11 +133,14 @@ struct Ketinggian {
 static Ketinggian bacaKetinggian() {
   float s[ULTRA_SAMPLES];
   int n = 0;
+  Serial.print("Ultrasonik    : ");
   for (int i = 0; i < ULTRA_SAMPLES; ++i) {
     float d = pingOnce();
-    if (!isnan(d)) s[n++] = d;
-    delay(30);   // let the echo decay before the next ping
+    if (!isnan(d)) { s[n++] = d; Serial.print(d, 1); Serial.print(" "); }
+    else             Serial.print("x ");   // x = ping ini timeout, bukan sensor mati total
+    delay(ULTRA_PING_GAP_MS);   // module needs a full cycle before the next trigger
   }
+  Serial.print("cm ("); Serial.print(n); Serial.print("/"); Serial.print(ULTRA_SAMPLES); Serial.println(" valid)");
 
   Ketinggian out;
   if (n == 0) {
@@ -211,6 +229,9 @@ void loop() {
 
     // --- Serial Monitor ---
     Serial.println("----------------------------");
+    Serial.print("WiFi          : ");
+    if (wifiUp()) { Serial.print("connected, RSSI "); Serial.println(WiFi.RSSI()); }
+    else          { Serial.print("belum connect (status="); Serial.print(WiFi.status()); Serial.println(")"); }
     Serial.print("Hujan(sensor) : "); Serial.println(hujanAda ? "YA" : "TIDAK");
     if (k.valid) {
       Serial.print("Air           : "); Serial.print(k.tinggi_cm); Serial.println(" cm");
@@ -272,6 +293,13 @@ void loop() {
     row.rssi       = wifiUp() ? (int16_t)WiFi.RSSI() : 0;
     row.sms_status = lastSmsStatus;
 
+    // Echo the exact CSV row to Serial too -- so time_src, rssi, tip_total,
+    // pompa and sms_status are visible on the bench even without an SD card
+    // or a way to read it off the field.
+    char csvLine[256];
+    formatRow(csvLine, sizeof(csvLine), row);
+    Serial.print("[LOG] "); Serial.print(csvLine);
+
     if (!logRow(row)) Serial.println("[WARN] gagal tulis log ke SD");
 
     rainWindow.advanceMinute();
@@ -281,13 +309,24 @@ void loop() {
 
   // ---- upload backlog, every UPLOAD_PERIOD_MS ----
   if (now - tUpload >= UPLOAD_PERIOD_MS) {
-    tUpload = now;
-    if (wifiUp()) uploadBatch(60);
+    if (wifiUp()) {
+      tUpload = now;
+      int sent = uploadBatch(60);
+      if (sent > 0)      { Serial.print("[UPLOAD] terkirim "); Serial.print(sent); Serial.println(" baris"); }
+      else if (sent == 0) Serial.println("[UPLOAD] tidak ada baris baru untuk dikirim");
+      else                Serial.println("[UPLOAD] gagal (server tidak merespons / bukan 2xx) - cursor tidak maju, dicoba lagi nanti");
+    } else {
+      Serial.println("[UPLOAD] dilewati - WiFi belum connect");
+    }
   }
 
-  // ---- NTP resync, every NTP_PERIOD_MS ----
-  if (now - tNtp >= NTP_PERIOD_MS) {
+  // ---- NTP resync. Retry every 30s until the FIRST sync succeeds (tNtp==0
+  // at boot would otherwise mean the first attempt waits a full
+  // NTP_PERIOD_MS -- 6 hours -- before ever trying). Once synced, fall back
+  // to the slow periodic resync that only corrects RTC drift. ----
+  uint32_t ntpInterval = ntpEverSynced ? NTP_PERIOD_MS : 30000UL;
+  if (now - tNtp >= ntpInterval) {
     tNtp = now;
-    if (wifiUp()) timeSyncNtp();
+    if (wifiUp() && timeSyncNtp()) ntpEverSynced = true;
   }
 }

@@ -1,1 +1,8 @@
 .pio
+
+# Real WiFi password, phone number, ingest URL, device id -- never commit this.
+# This repo is nested/separate from the syurell root repo (its own .git, own
+# GitHub remote), so the root .gitignore's rule for this same path does NOT
+# apply here -- each repo only honors its own .gitignore.
+include/config_secrets.h
+!include/config_secrets.h.example

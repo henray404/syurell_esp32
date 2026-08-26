@@ -13,7 +13,11 @@ static char g_logPath[32];
 static bool g_sdOk = false;
 
 inline bool loggerBegin() {
-  g_sdOk = SD.begin(SD_CS_PIN);
+  // Explicit pins: the ESP32's default VSPI SCK (GPIO18) is ECHO_PIN. Letting
+  // SD.begin() fall back to the default bus would silently steal the
+  // ultrasonic echo pin for SPI clock. See config.h's SD_SCK_PIN comment.
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  g_sdOk = SD.begin(SD_CS_PIN, SPI);
   if (g_sdOk) SD.mkdir("/data");
   return g_sdOk;
 }
