@@ -22,6 +22,8 @@ inline bool loggerBegin() {
   return g_sdOk;
 }
 
+inline bool loggerOk() { return g_sdOk; }
+
 inline const char *currentLogPath() {
   const char *iso = nowIsoUtc();            // "YYYY-MM-DDTHH:MM:SSZ"
   snprintf(g_logPath, sizeof(g_logPath), "/data/%.10s.csv", iso);

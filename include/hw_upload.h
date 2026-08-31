@@ -34,6 +34,37 @@ inline void writeCursor(uint32_t v) {
   f.close();
 }
 
+// Sends one row straight from memory, skipping the card. Normal operation
+// replays rows off SD so a network outage cannot lose data; this is the fallback
+// for when there is no card to replay from, where the choice is between sending
+// live or sending nothing. A failure here loses the row -- unavoidable, since
+// nothing else is holding it.
+inline bool uploadRowDirect(const char *csvLine) {
+  if (!wifiUp()) return false;
+
+  String body = "{\"device\":\"";
+  body += DEVICE_ID;
+  body += "\",\"rows\":[{\"csv\":\"";
+  // The formatted row ends in a newline, which is not legal inside a JSON
+  // string. Copy it out without the line endings.
+  for (const char *c = csvLine; *c; ++c) {
+    if (*c != '\n' && *c != '\r') body += *c;
+  }
+  body += "\"}]}";
+
+  HTTPClient http;
+  http.begin(INGEST_URL);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(body);
+  http.end();
+
+  if (code >= 200 && code < 300) return true;
+  Serial.print("[UPLOAD-LANGSUNG] gagal, code "); Serial.print(code);
+  if (code < 0) { Serial.print(" "); Serial.print(HTTPClient::errorToString(code)); }
+  Serial.println();
+  return false;
+}
+
 // Sends up to max_rows unsent rows from today's file as JSON.
 // Returns rows accepted, 0 if nothing to do, -1 on failure.
 inline int uploadBatch(int max_rows) {
@@ -41,7 +72,12 @@ inline int uploadBatch(int max_rows) {
 
   const char *path = currentLogPath();
   File f = SD.open(path, FILE_READ);
-  if (!f) return 0;
+  if (!f) {
+    // Upload replays rows off the card, so no card means nothing is ever sent
+    // however healthy the network is. Say which of the two it is.
+    Serial.print("[UPLOAD] file log tidak terbaca: "); Serial.println(path);
+    return 0;
+  }
 
   uint32_t cursor = readCursor();
   if (cursor > f.size()) cursor = 0;      // file rotated to a new day
@@ -74,6 +110,18 @@ inline int uploadBatch(int max_rows) {
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   http.end();
+
+  // A negative code never reached the server: wrong subnet, server bound to
+  // localhost, firewall. A positive one means the server answered and rejected
+  // the body. Different problems, so print which.
+  if (code < 0) {
+    Serial.print("[UPLOAD] tidak sampai ke server ("); Serial.print(code);
+    Serial.print(" "); Serial.print(HTTPClient::errorToString(code));
+    Serial.print(") url="); Serial.println(INGEST_URL);
+  } else if (code < 200 || code >= 300) {
+    Serial.print("[UPLOAD] server balas HTTP "); Serial.print(code);
+    Serial.print(" untuk "); Serial.print(count); Serial.println(" baris");
+  }
 
   // Advance only on an explicit 2xx. Anything else leaves the cursor alone so
   // the same rows are retried.

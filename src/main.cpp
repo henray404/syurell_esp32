@@ -2,7 +2,7 @@
 // SISTEM PENCEGAH BANJIR - ESP32
 // v2.0 - median filter, rolling rain window, hysteresis, ISR tip counting,
 //        verified SMS, DS3231+NTP timekeeping, SD logging, WiFi upload.
-// Design: docs/superpowers/specs/2026-08-15-esp32-logging-design.md
+// Design: docs/laporan/02-dokumentasi-teknis.md (repo syurel-website)
 // =============================================
 
 #include <Arduino.h>
@@ -10,6 +10,8 @@
 #include "config.h"
 #include "config_secrets.h"
 #include "logic_median.h"
+#include "logic_height.h"
+#include "hw_ultra.h"
 #include "logic_rain.h"
 #include "logic_level.h"
 #include "logic_csv.h"
@@ -22,6 +24,8 @@ HardwareSerial sim800(2);
 
 // --- STATE ---
 static RainWindow rainWindow;
+static uint32_t   tRainMinute = 0;   // rotates the rain bins on real time
+
 static LevelFsm    levelFsm;
 static Level       lastLevel = AMAN;
 static uint32_t    tipTotal  = 0;
@@ -63,14 +67,36 @@ static uint32_t tSensor = 0, tLog = 0, tUpload = 0, tNtp = 0, tSms = 0;
 
 
 
+#if MODE_SMS_TEST
+static const char *kirimSMS(const String &pesan);   // defined below, used by the test block
+
+// Sends one AT command and prints whatever the modem actually answers, raw.
+// Printing the reply rather than a pass/fail verdict is the point: a new SIM
+// fails for reasons the firmware cannot name -- PIN locked, not registered, no
+// 2G left on the operator -- and the modem says which one in its own words.
+static String atAsk(const char *cmd, uint32_t wait_ms) {
+  while (sim800.available()) sim800.read();      // drop stale bytes
+  sim800.println(cmd);
+  String acc;
+  uint32_t start = millis();
+  while (millis() - start < wait_ms) {
+    while (sim800.available()) acc += (char)sim800.read();
+    if (acc.indexOf("OK") >= 0 || acc.indexOf("ERROR") >= 0) break;
+  }
+  acc.trim();
+  Serial.print(cmd); Serial.print("  ->  ");
+  Serial.println(acc.length() ? acc : String("(tidak ada jawaban)"));
+  return acc;
+}
+#endif
+
 // =============================================
 // SETUP
 // =============================================
 void setup() {
   Serial.begin(115200);
 
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+  ultraBegin();
   pinMode(RAIN_SENSOR_PIN, INPUT);
   pinMode(RAIN_GAUGE_PIN, INPUT_PULLUP);
   pinMode(RELAY_PIN, OUTPUT);
@@ -82,38 +108,84 @@ void setup() {
   sim800.begin(9600, SERIAL_8N1, 16, 17);
   delay(3000);
 
+#if MODE_SMS_TEST
+  Serial.println();
+  Serial.println("=== MODE SMS TEST - sistem banjir TIDAK jalan ===");
+  Serial.println();
+
+  // The module ships in autobaud: it locks its rate onto the first few "AT"s it
+  // sees, and a module already locked elsewhere answers nothing at 9600. Sweep
+  // the common rates and knock several times at each before calling it dead.
+  long bauds[] = {9600, 115200, 38400, 57600, 19200, 4800};
+  long found = 0;
+  for (unsigned i = 0; i < sizeof(bauds)/sizeof(bauds[0]) && !found; i++) {
+    sim800.begin(bauds[i], SERIAL_8N1, 16, 17);
+    delay(300);
+    Serial.print("coba baud "); Serial.print(bauds[i]); Serial.print(" ... ");
+    for (int k = 0; k < 5 && !found; k++) {
+      while (sim800.available()) sim800.read();
+      sim800.println("AT");
+      uint32_t t0 = millis();
+      String acc;
+      while (millis() - t0 < 600) {
+        while (sim800.available()) acc += (char)sim800.read();
+        if (acc.indexOf("OK") >= 0) { found = bauds[i]; break; }
+      }
+    }
+    Serial.println(found ? "JAWAB" : "diam");
+  }
+  if (found) {
+    sim800.begin(found, SERIAL_8N1, 16, 17);
+    delay(200);
+    Serial.print(">> Modem menjawab di baud "); Serial.println(found);
+    if (found != 9600) {
+      Serial.println("   Bukan 9600. Ubah sim800.begin(...) di main.cpp ke baud ini,");
+      Serial.println("   atau kunci modul: AT+IPR=9600 lalu AT&W.");
+    }
+  }
+
+  String r = found ? String("OK") : String("");
+  if (r.indexOf("OK") < 0) {
+    Serial.println(">> GAGAL: modem tidak menjawab.");
+    Serial.println("   Cek power (butuh 4V, arus 2A) dan TX->GPIO16 / RX->GPIO17.");
+    Serial.println("   GND modul WAJIB nyambung ke GND ESP32.");
+  } else {
+    atAsk("AT+CPIN?", 3000);   // harus READY
+    atAsk("AT+CSQ", 2000);     // angka pertama 10-31; 99 = tidak ada sinyal
+    atAsk("AT+CREG?", 3000);   // ,1 atau ,5 = terdaftar
+    atAsk("AT+COPS?", 5000);   // nama operator
+    atAsk("AT+CMGF=1", 2000);  // mode teks
+
+    Serial.println();
+    Serial.print("Kirim SMS tes ke "); Serial.println(NOMOR_TUJUAN);
+    const char *st = kirimSMS("[TES] Sistem Banjir - SIM card baru OK. Abaikan pesan ini.");
+    Serial.print(">> Hasil kirim: "); Serial.println(st);
+    if (strcmp(st, "ok") == 0) {
+      Serial.println("   SMS diterima jaringan. Cek HP tujuan.");
+    } else {
+      Serial.println("   Gagal. no_modem=wiring/power, no_prompt=modem tolak nomor,");
+      Serial.println("   send_failed=pulsa/registrasi/sinyal 2G.");
+    }
+  }
+
+  Serial.println();
+  Serial.println("--- terminal AT manual, ketik perintah lalu Enter ---");
+  Serial.println("Set MODE_SMS_TEST 0 di config.h untuk kembali normal.");
+  for (;;) {                       // never returns: loop() is not reached
+    while (Serial.available())  sim800.write(Serial.read());
+    while (sim800.available())  Serial.write(sim800.read());
+  }
+#endif
+
   timeBegin();
   if (!loggerBegin()) Serial.println("[WARN] SD tidak terdeteksi - data TIDAK akan tersimpan");
   uploadBegin();
 
+  diagUltrasonik();
+#if MODE_SIMULASI
+  Serial.println("*** MODE SIMULASI AKTIF - ketinggian air HARDCODE, sensor diabaikan ***");
+#endif
   Serial.println("=== SISTEM BANJIR v2.0 AKTIF ===");
-}
-
-// =============================================
-// BACA JARAK - JSN-SR04T (single ping)
-// =============================================
-static float pingOnce() {
-  // 20 us trigger, not the datasheet-minimum 10 us: on this JSN-SR04T a 10 us
-  // pulse produced no echo at all, a 20 us one reads every time.
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(20);
-  digitalWrite(TRIG_PIN, LOW);
-
-  // Poll the edges instead of pulseIn(); pulseIn() never caught this module's
-  // echo on this board even when the pulse was demonstrably there.
-  unsigned long tS = micros(), tRise = 0, tFall = 0;
-  while (micros() - tS < ULTRA_ECHO_TIMEOUT_US) {
-    if (digitalRead(ECHO_PIN)) { tRise = micros(); break; }
-  }
-  if (!tRise) return NAN;
-  while (micros() - tRise < ULTRA_ECHO_TIMEOUT_US) {
-    if (!digitalRead(ECHO_PIN)) { tFall = micros(); break; }
-  }
-  if (!tFall) return NAN;
-
-  return ((tFall - tRise) * 0.034f) / 2.0f;
 }
 
 // =============================================
@@ -123,48 +195,71 @@ static float pingOnce() {
 // clamped a too-close reading to 0 cm, which reads as SAFE at the single most
 // dangerous moment.
 // =============================================
-struct Ketinggian {
-  float jarak_cm;
-  float tinggi_cm;
-  bool valid;
-  const char *reason;   // "" | "timeout" | "too_close" | "out_of_range"
-};
-
 static Ketinggian bacaKetinggian() {
+#if MODE_SIMULASI
+  // Printed every cycle on purpose: a hardcoded reading that goes quiet is a
+  // hardcoded reading someone ships by accident.
+  Serial.print("[SIMULASI] tinggi air dipaksa ");
+  Serial.print(SIMULASI_TINGGI_CM, 1);
+  Serial.println(" cm - sensor TIDAK dibaca");
+  Ketinggian sim;
+  sim.tinggi_cm = SIMULASI_TINGGI_CM;
+  sim.jarak_cm  = JARAK_DASAR - SIMULASI_TINGGI_CM;   // what the sensor would report
+  sim.valid     = true;
+  sim.reason    = "";
+  return sim;
+#else
   float s[ULTRA_SAMPLES];
   int n = 0;
   Serial.print("Ultrasonik    : ");
   for (int i = 0; i < ULTRA_SAMPLES; ++i) {
-    float d = pingOnce();
-    if (!isnan(d)) { s[n++] = d; Serial.print(d, 1); Serial.print(" "); }
-    else             Serial.print("x ");   // x = ping ini timeout, bukan sensor mati total
+    // The echo width is the only thing the module actually reports; every cm
+    // below is derived from it. Print it under DEBUG_SENSOR, because a width
+    // that is identical ping after ping is the module's ring-down rather than
+    // an echo, and no distance in cm can show you that.
+    unsigned long w = pingWidthUs();
+    if (w) {
+      s[n++] = usToCm(w);
+#if DEBUG_SENSOR
+      Serial.print(w); Serial.print("us/");
+#endif
+      Serial.print(usToCm(w), 1); Serial.print(" ");
+    } else {
+      Serial.print("x ");   // x = ping ini timeout, bukan sensor mati total
+    }
     delay(ULTRA_PING_GAP_MS);   // module needs a full cycle before the next trigger
   }
   Serial.print("cm ("); Serial.print(n); Serial.print("/"); Serial.print(ULTRA_SAMPLES); Serial.println(" valid)");
 
-  Ketinggian out;
-  if (n == 0) {
-    out.jarak_cm = NAN; out.tinggi_cm = NAN; out.valid = false; out.reason = "timeout";
-    return out;
-  }
+  Ketinggian k = heightFrom(s, n);   // median, offset and range gates: logic_height.h
 
-  float jarak = medianOf(s, n);
-  out.jarak_cm = jarak;
-
-  if (jarak < SENSOR_BLIND_CM) {
-    out.tinggi_cm = NAN; out.valid = false; out.reason = "too_close";
-    return out;
+#if DEBUG_SENSOR
+  // heightFrom() runs medianOf(), which sorts s in place, so after the call
+  // s[0] and s[n-1] are the extremes. Reading them is why this block sits here
+  // and not before the call.
+  if (n > 0) {
+    Serial.print("  sebaran     : min "); Serial.print(s[0], 1);
+    Serial.print("  med "); Serial.print(s[n / 2], 1);
+    Serial.print("  max "); Serial.print(s[n - 1], 1);
+    Serial.print("  delta "); Serial.print(s[n - 1] - s[0], 2);
+    Serial.println(" cm");
   }
-  if (jarak > JARAK_DASAR + 20.0f) {
-    out.tinggi_cm = NAN; out.valid = false; out.reason = "out_of_range";
-    return out;
+  // Every step from median to verdict, so a wrong height can be traced to the
+  // step that produced it instead of guessing between offset and gate.
+  Serial.print("  jarak       : ");
+  if (n > 0) { Serial.print(s[n / 2], 1); Serial.print(" + offset "); Serial.print(ULTRA_OFFSET_CM, 1);
+               Serial.print(" = "); Serial.print(k.jarak_cm, 1); Serial.print(" cm"); }
+  else       { Serial.print("- (tidak ada echo)"); }
+  Serial.print("   gerbang "); Serial.print(SENSOR_BLIND_CM, 1);
+  Serial.print("-"); Serial.print(JARAK_DASAR + ULTRA_RANGE_SLACK_CM, 1);
+  Serial.print(" cm -> "); Serial.println(k.valid ? "OK" : k.reason);
+  if (ULTRA_OFFSET_CM == 0.0f) {
+    Serial.println("  [!] ULTRA_OFFSET_CM masih 0 - tinggi air bisa lebih ~1 cm dari asli");
   }
+#endif
 
-  float tinggi = JARAK_DASAR - jarak;
-  out.tinggi_cm = (tinggi < 0) ? 0 : tinggi;
-  out.valid = true;
-  out.reason = "";
-  return out;
+  return k;
+#endif
 }
 
 // =============================================
@@ -228,18 +323,54 @@ void loop() {
     Level lv = levelFsm.update(k.valid ? k.tinggi_cm : 0.0f, k.valid, mmPerJam, now);
 
     // --- Serial Monitor ---
+    // Ordered raw-to-derived: what each sensor reported, then what the system
+    // concluded from it. Under DEBUG_SENSOR every input carries its raw form
+    // alongside the cooked one, so a wrong verdict can be traced to the reading
+    // that caused it without reflashing.
     Serial.println("----------------------------");
-    Serial.print("WiFi          : ");
-    if (wifiUp()) { Serial.print("connected, RSSI "); Serial.println(WiFi.RSSI()); }
-    else          { Serial.print("belum connect (status="); Serial.print(WiFi.status()); Serial.println(")"); }
-    Serial.print("Hujan(sensor) : "); Serial.println(hujanAda ? "YA" : "TIDAK");
+    // Distance is what the sensor measures; height is derived from it. Printed
+    // even when the height is rejected: "Jarak 22.0 / Air INVALID (too_close)"
+    // says the module answered but out of range, which a bare INVALID does not.
+    Serial.print("Jarak         : ");
+    if (isnan(k.jarak_cm)) Serial.println("- (tidak ada echo)");
+    else { Serial.print(k.jarak_cm, 1); Serial.println(" cm"); }
     if (k.valid) {
       Serial.print("Air           : "); Serial.print(k.tinggi_cm); Serial.println(" cm");
     } else {
       Serial.print("Air           : INVALID ("); Serial.print(k.reason); Serial.println(")");
     }
+    Serial.print("Hujan(sensor) : "); Serial.print(hujanAda ? "YA" : "TIDAK");
+#if DEBUG_SENSOR
+    // The raw pin state, because "TIDAK" and "sensor unplugged" look identical
+    // otherwise -- the rain board is active-LOW and a floating input reads HIGH.
+    Serial.print("  (pin "); Serial.print(RAIN_SENSOR_PIN);
+    Serial.print("="); Serial.print(digitalRead(RAIN_SENSOR_PIN)); Serial.print(", aktif-LOW)");
+#endif
+    Serial.println();
     Serial.print("Curah         : "); Serial.print(mmPerJam); Serial.println(" mm/jam");
-    Serial.print("Status        : "); Serial.println(LevelFsm::name(lv));
+#if DEBUG_SENSOR
+    // Tip counters behind that number. mm/jam moving without tips moving means
+    // the window arithmetic is at fault, not the bucket.
+    Serial.print("  tipping     : +"); Serial.print(tips);
+    Serial.print(" siklus ini   menit "); Serial.print(rainWindow.lastMinuteTips());
+    Serial.print("   total "); Serial.print(tipTotal);
+    Serial.print("   jendela "); Serial.print(RAIN_WINDOW_MIN); Serial.println(" menit");
+#endif
+    Serial.print("Status        : "); Serial.print(LevelFsm::name(lv));
+    Serial.print("   pompa "); Serial.println(lv >= WASPADA ? "ON" : "OFF");
+#if DEBUG_SENSOR
+    Serial.print("  ambang      : waspada "); Serial.print(WASPADA_ENTER, 1);
+    Serial.print("/"); Serial.print(WASPADA_EXIT, 1);
+    Serial.print("  bahaya "); Serial.print(BAHAYA_ENTER, 1);
+    Serial.print("/"); Serial.print(BAHAYA_EXIT, 1); Serial.println(" cm (masuk/keluar)");
+    Serial.print("Waktu         : "); Serial.print(nowIsoUtc());
+    Serial.print("  src="); Serial.print(timeSource());
+    Serial.print("   uptime "); Serial.print(now / 1000); Serial.println(" s");
+    Serial.print("SD            : "); Serial.println(loggerOk() ? "ok" : "TIDAK ADA - data tidak tersimpan");
+#endif
+    Serial.print("WiFi          : ");
+    if (wifiUp()) { Serial.print("connected, RSSI "); Serial.println(WiFi.RSSI()); }
+    else          { Serial.print("belum connect (status="); Serial.print(WiFi.status()); Serial.println(")"); }
 
     // Pump follows the level, driven on state change only -- not every loop
     // iteration, and the hysteresis in LevelFsm is what stops relay chatter.
@@ -300,11 +431,24 @@ void loop() {
     formatRow(csvLine, sizeof(csvLine), row);
     Serial.print("[LOG] "); Serial.print(csvLine);
 
-    if (!logRow(row)) Serial.println("[WARN] gagal tulis log ke SD");
+    if (!logRow(row)) {
+      // No card to replay from, so the row goes out now or not at all.
+      Serial.println("[WARN] gagal tulis log ke SD - kirim langsung tanpa SD");
+      if (uploadRowDirect(csvLine)) Serial.println("[UPLOAD-LANGSUNG] terkirim 1 baris");
+    }
 
-    rainWindow.advanceMinute();
     minuteCount = 0;
     lastSmsStatus = "";
+  }
+
+  // ---- rain window, every real minute ----
+  // On its own clock, not the logging one: the bins ARE minutes, so rotating
+  // them at the log period would rescale the whole window whenever that period
+  // changes -- and the debug build logs every 10 s, which would quietly turn the
+  // 60-minute window into a 6-minute one and under-report mm/jam sixfold.
+  if (now - tRainMinute >= 60000UL) {
+    tRainMinute = now;
+    rainWindow.advanceMinute();
   }
 
   // ---- upload backlog, every UPLOAD_PERIOD_MS ----
@@ -315,9 +459,11 @@ void loop() {
       if (sent > 0)      { Serial.print("[UPLOAD] terkirim "); Serial.print(sent); Serial.println(" baris"); }
       else if (sent == 0) Serial.println("[UPLOAD] tidak ada baris baru untuk dikirim");
       else                Serial.println("[UPLOAD] gagal (server tidak merespons / bukan 2xx) - cursor tidak maju, dicoba lagi nanti");
-    } else {
-      Serial.println("[UPLOAD] dilewati - WiFi belum connect");
-    }
+    } 
+    // else {
+    //   // Serial.println("[UPLOAD] dilewati - WiFi belum connect");
+    
+    // }
   }
 
   // ---- NTP resync. Retry every 30s until the FIRST sync succeeds (tNtp==0
